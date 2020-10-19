@@ -66,9 +66,9 @@ def _validate(device, model, dl, criterion, return_values=True):
             targets = targets.to(device)
             outputs = model(inputs)
             val_loss += criterion(outputs, targets) * inputs.size(0)
-            if targets.dim == 1:
+            if targets.dim() == 1:
                 outputs = outputs.softmax(-1).argmax(-1)
-            elif targets.dim == 2:
+            elif targets.dim() == 2:
                 outputs = outputs.sigmoid()
             all_preds.extend(outputs.detach().cpu().numpy())
         val_loss /= len(dl)
