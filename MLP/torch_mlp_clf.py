@@ -10,6 +10,7 @@ import torchvision.datasets
 import logging
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
+from sklearn.metrics import average_precision_score
 
 
 def seed_everything(seed=42):
@@ -25,8 +26,8 @@ def seed_everything(seed=42):
 
 class EarlyStopping():
     def __init__(self, target='acc', objective='max', patience=10):
-        self.crit_targ = target.lower()
-        self.crit_obj = objective.lower()
+        self.crit_targ = target
+        self.crit_obj = objective
         self.patience = patience
         self.stopped_epoch = 0
         self.wait = 0
@@ -65,7 +66,11 @@ def _validate(device, model, dl, criterion, return_values=True):
             targets = targets.to(device)
             outputs = model(inputs)
             val_loss += criterion(outputs, targets) * inputs.size(0)
-            all_preds.extend(outputs.argmax(-1).detach().cpu().numpy())
+            if targets.dim == 1:
+                outputs = outputs.softmax(-1).argmax(-1)
+            elif targets.dim == 2:
+                outputs = outputs.sigmoid()
+            all_preds.extend(outputs.detach().cpu().numpy())
         val_loss /= len(dl)
     if return_values:
         return val_loss, np.array(all_targets), np.array(all_preds)
@@ -77,7 +82,7 @@ def _train(device, model, dl, criterion, optimizer, scheduler=None):
     train_loss = 0.0
     for inputs, labels in dl:
         inputs = inputs.to(device)
-        org_labels = labels = labels.to(device)
+        labels = labels.to(device)
         optimizer.zero_grad()
         outputs = model(inputs)
         loss = criterion(outputs, labels)
@@ -94,6 +99,8 @@ def _calc_metric(metrics, targets, preds):
     results = {}
     if 'acc' in metrics:
         results['acc'] = sum(targets == preds) / len(targets)
+    if 'mAP' in metrics:
+        results['mAP'] = average_precision_score(targets, preds)
     return results
 
 
@@ -180,10 +187,24 @@ class TorchMLPClassifier:
         self.epsilon=epsilon
         self.n_iter_no_change=n_iter_no_change
         self.max_fun=max_fun
+        self.debug = debug
         if debug:
             logging.basicConfig(level=logging.DEBUG)
 
+    def switch_regime(self, y):
+        if y.ndim == 2: # multi label
+            n_class = y.shape[1]
+            return 'mAP', nn.BCEWithLogitsLoss(), n_class, torch.Tensor
+        elif y.ndim == 1: # classification
+            n_class = len(list(set(y)))
+            return 'acc', nn.CrossEntropyLoss(), n_class, torch.tensor
+        raise Exception(f'Unsupported shape of y: {y.shape}')
+
     def fit(self, X, y, device=torch.device('cuda'), logger=None):
+        y = np.array(y)
+        metric, criterion, n_class, label_type = self.switch_regime(y)
+        logger = logger if logger else logging.getLogger(__name__)
+
         n_samples = len(X)
         bs = min(200, n_samples) if self.batch_size.lower() == 'auto' else self.batch_size
         train_kwargs = {'batch_size': bs, 'drop_last': False, 'shuffle': self.shuffle}
@@ -193,30 +214,49 @@ class TorchMLPClassifier:
         self.scaler.fit(X)
         X = self.scaler.transform(X)
 
-        self.classes = sorted(list(set(y)))
         Xtrn, Xval, ytrn, yval = train_test_split(X, y, test_size=self.validation_fraction, random_state=self.random_state)
-        Xtrn, Xval, ytrn, yval = torch.Tensor(Xtrn), torch.Tensor(Xval), torch.tensor(ytrn), torch.tensor(yval)
+        Xtrn, Xval, ytrn, yval = torch.Tensor(Xtrn), torch.Tensor(Xval), label_type(ytrn), label_type(yval)
 
         train_loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(Xtrn, ytrn), **train_kwargs)
         eval_loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(Xval, yval), **test_kwargs)
 
-        model = MLP(input_size=X.shape[-1], hidden_size=self.hidden_layer_sizes[0], output_size=len(self.classes))
+        if self.debug:
+            print(metric, criterion, n_class, label_type)
+        model = MLP(input_size=X.shape[-1], hidden_size=self.hidden_layer_sizes[0], output_size=n_class)
         self.model = model.to(device)
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.learning_rate_init, betas=(self.beta_1, self.beta_2), eps=self.epsilon)
-        self.criterion = nn.CrossEntropyLoss()
-        return _train_model(device, self.model, self.criterion, self.optimizer, None, train_loader, eval_loader, metric='acc',
+        self.criterion = criterion
+        return _train_model(device, self.model, self.criterion, self.optimizer, None, train_loader, eval_loader, metric=metric,
                             num_epochs=self.max_iter, seed=self.random_state, patience=self.n_iter_no_change, logger=logger)
 
     def score(self, test_X, test_y, device=torch.device('cuda'), logger=None):
+        test_y = np.array(test_y)
+        metric, criterion, n_class, label_type = self.switch_regime(test_y)
         logger = logger if logger else logging.getLogger(__name__)
+
         bs = 256 if self.batch_size.lower() == 'auto' else self.batch_size
         test_kwargs = {'batch_size': bs, 'drop_last': False, 'shuffle': False}
 
         test_X = self.scaler.transform(test_X)
 
-        Xval, yval = torch.Tensor(test_X), torch.tensor(test_y)
+        Xval, yval = torch.Tensor(test_X), label_type(test_y)
         eval_loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(Xval, yval), **test_kwargs)
 
         val_loss, targets, preds = _validate(device, self.model, eval_loader, self.criterion)
-        metrics = _calc_metric(['acc'], targets, preds)
-        return metrics['acc']
+        metrics = _calc_metric([metric], targets, preds)
+        return metrics[metric]
+
+    def predict(self, X, device=torch.device('cuda'), multi_label_n_class=None, logger=None):
+        logger = logger if logger else logging.getLogger(__name__)
+
+        bs = 256 if self.batch_size.lower() == 'auto' else self.batch_size
+        test_kwargs = {'batch_size': bs, 'drop_last': False, 'shuffle': False}
+        X = self.scaler.transform(X)
+        X = torch.Tensor(X)
+        y = (torch.zeros((len(X)), dtype=torch.int) if multi_label_n_class is None else
+             torch.zeros((len(X), multi_label_n_class), dtype=torch.float))
+        eval_loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(X, y), **test_kwargs)
+
+        val_loss, targets, preds = _validate(device, self.model, eval_loader, self.criterion)
+        return preds
+
