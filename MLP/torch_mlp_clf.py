@@ -24,6 +24,38 @@ def seed_everything(seed=42):
     torch.backends.cudnn.benchmark = False
 
 
+def all_same_classes(y_a, y_b, delimiter=None):
+    # binary matrix multi-label table, test that class existance is the same.
+    y_a, y_b = y_a.sum(axis=0), y_b.sum(axis=0)
+    classes_a, classes_b = y_a > 0, y_b > 0
+    return np.all(classes_a == classes_b)
+
+
+def train_test_sure_split(X, y, n_attempt=100, return_last=False, debug=False, **kwargs):
+    """Variant of train_test_split that makes validation for sure.
+    Returned y_test should contain all class samples at least one.
+    Simply try train_test_split repeatedly until the result satisfies this condition.
+
+    Args:
+        n_attempt: Number of attempts to satisfy class coverage.
+        return_last: Return last attempt results if all attempts didn't satisfy.
+
+    Returns:
+        X_train, X_test, y_train, y_test if satisfied;
+        or None, None, None, None.
+    """
+
+    for i in range(n_attempt):
+        X_trn, X_val, y_trn, y_val = train_test_split(X, y, **kwargs)
+        if all_same_classes(y, y_val):
+            return X_trn, X_val, y_trn, y_val
+        if debug:
+            print('.', end='')
+    if return_last:
+        return X_trn, X_val, y_trn, y_val
+    return None, None, None, None
+
+
 class EarlyStopping():
     def __init__(self, target='acc', objective='max', patience=10):
         self.crit_targ = target
@@ -105,10 +137,12 @@ def _calc_metric(metrics, targets, preds):
 
 
 def _train_model(device, model, criterion, optimizer, scheduler, trn_dl, val_dl, metric='acc',
-                num_epochs=200, seed=None, patience=10, logger=None):
+                num_epochs=200, seed=None, patience=10, stop_metric=None, logger=None):
     seed_everything(seed)
     logger = logger if logger else logging.getLogger(__name__)
-    early_stopper = EarlyStopping(patience=patience, target=metric, objective='max')
+    stop_metric = metric if stop_metric is None else stop_metric
+    stop_objective = 'min' if stop_metric is 'loss' else 'max'
+    early_stopper = EarlyStopping(patience=patience, target=stop_metric, objective=stop_objective)
     since = time.time()
 
     for epoch in range(num_epochs):
@@ -137,14 +171,44 @@ def _train_model(device, model, criterion, optimizer, scheduler, trn_dl, val_dl,
 
 
 class MLP(nn.Module):
-    def __init__(self, input_size, hidden_size, output_size):
-        super(MLP, self).__init__()
-        self.fc1 = nn.Linear(input_size, hidden_size)
-        self.fc2 = nn.Linear(hidden_size, output_size)
+    def __init__(self, input_size, hidden_sizes, output_size):
+        super().__init__()
+        sizes = [input_size] + list(hidden_sizes) + [output_size]
+        fcs = []
+        for in_size, out_size in zip(sizes[:-1], sizes[1:]):
+            fcs.append(nn.Linear(in_size, out_size))
+            # fcs.append(nn.Dropout(0.2))
+            fcs.append(nn.ReLU())
+        self.mlp = nn.Sequential(*fcs[:-1])
         
     def forward(self, x):
-        out = self.fc2(F.relu(self.fc1(x)))
+        out = self.mlp(x)
         return out
+
+
+class BetterMLP(nn.Module):
+    def __init__(self, input_size, hidden_sizes, output_size):
+        flat_in_dim = input_size
+        hid_dim = hidden_sizes[0]
+        n_classes = output_size
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(flat_in_dim, hid_dim),
+            nn.BatchNorm1d(hid_dim),
+            nn.ReLU(),
+            nn.Dropout(p=0.5),
+            nn.Linear(hid_dim, hid_dim),
+            nn.BatchNorm1d(hid_dim),
+            nn.ReLU(),
+            nn.Dropout(p=0.3),
+            nn.Linear(hid_dim, hid_dim),
+            nn.BatchNorm1d(hid_dim),
+            nn.ReLU(),
+            nn.Dropout(p=0.3),
+            nn.Linear(hid_dim, n_classes)
+        )
+    def forward(self, x):
+        return self.net(x)
 
 
 class TorchMLPClassifier:
@@ -214,18 +278,20 @@ class TorchMLPClassifier:
         self.scaler.fit(X)
         X = self.scaler.transform(X)
 
-        Xtrn, Xval, ytrn, yval = train_test_split(X, y, test_size=self.validation_fraction, random_state=self.random_state)
+        Xtrn, Xval, ytrn, yval = train_test_sure_split(X, y, test_size=self.validation_fraction,
+                                                       random_state=self.random_state)
         Xtrn, Xval, ytrn, yval = torch.Tensor(Xtrn), torch.Tensor(Xval), label_type(ytrn), label_type(yval)
 
         train_loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(Xtrn, ytrn), **train_kwargs)
         eval_loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(Xval, yval), **test_kwargs)
 
-        if self.debug:
-            print(metric, criterion, n_class, label_type)
-        model = MLP(input_size=X.shape[-1], hidden_size=self.hidden_layer_sizes[0], output_size=n_class)
+        model = MLP(input_size=X.shape[-1], hidden_sizes=self.hidden_layer_sizes, output_size=n_class)
         self.model = model.to(device)
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.learning_rate_init, betas=(self.beta_1, self.beta_2), eps=self.epsilon)
         self.criterion = criterion
+        if self.debug:
+            print(model)
+            print(metric, criterion, n_class, label_type)
         return _train_model(device, self.model, self.criterion, self.optimizer, None, train_loader, eval_loader, metric=metric,
                             num_epochs=self.max_iter, seed=self.random_state, patience=self.n_iter_no_change, logger=logger)
 
@@ -259,4 +325,3 @@ class TorchMLPClassifier:
 
         val_loss, targets, preds = _validate(device, self.model, eval_loader, self.criterion)
         return preds
-
