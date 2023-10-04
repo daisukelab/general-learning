@@ -20,8 +20,13 @@ def cumulative_explained_variance(nsv: torch.Tensor) -> (torch.Tensor, torch.Ten
     return auc_cev, raw_cev
 
 
-def get_cumulative_explained_variance_auc(representations: torch.Tensor) -> torch.Tensor:
+def get_cumulative_explained_variance_auc(representations: torch.Tensor, repeat_samples: bool = False) -> torch.Tensor:
     # https://arxiv.org/abs/2209.15007 Alexander C. Li, et al., "Understanding Collapse in Non-Contrastive Siamese Representation Learning," in ECCV, 2022
+    assert len(representations.shape) == 2, f'Ensure that your representations have a shape of (samples, feature dimensions). The shape of yours is: {representations.shape}'
+    if repeat_samples:
+        org = representations.clone()
+        while representations.shape[0] < representations.shape[1]:
+            representations = torch.vstack([representations, org])
     nsv = normalized_singular_value(representations)
     assert representations.shape[-1] == nsv.shape[0], 'Ensure that the number of samples is greater than the number of feature dimensions' \
         f': representations.shape[-1]({representations.shape[-1]}) != nsv.shape[0]({nsv.shape[0]})'
