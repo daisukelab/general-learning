@@ -32,3 +32,12 @@ def get_cumulative_explained_variance_auc(representations: torch.Tensor, repeat_
         f': representations.shape[-1]({representations.shape[-1]}) != nsv.shape[0]({nsv.shape[0]})'
     auc, cev = cumulative_explained_variance(nsv)
     return auc
+
+
+def rank_me(representations: torch.Tensor) -> torch.Tensor:
+    # https://proceedings.mlr.press/v202/garrido23a.html Garrido, et al, "RankMe: Assessing the Downstream Performance of Pretrained Self-Supervised Representations by Their Rank," in ICML, 2023
+    sigma = torch.svd(representations).S
+    norm1_sigma = torch.norm(sigma, p=1)
+    p = sigma / norm1_sigma + torch.finfo(float).eps
+    rankme_value = (-p * p.log()).sum().exp()
+    return rankme_value
