@@ -258,16 +258,16 @@ def _train_model(device, model, criterion, optimizer, scheduler, trn_dl, val_dl,
         val_metrics['loss'] = val_loss
         # print log
         cur_lr = optimizer.param_groups[0]["lr"]
-        logging.debug(f'epoch {epoch+1:04d}/{num_epochs}: lr: {cur_lr:.7f}: loss={trn_loss:.6f} '
+        logging.info(f'epoch {epoch+1:04d}/{num_epochs}: lr: {cur_lr:.7f}: loss={trn_loss:.6f} '
                     + ' '.join([f'val_{n}={v:.7f}' for n, v in val_metrics.items()]))
         # early stopping
         if early_stopper.on_epoch_end(epoch, model, val_metrics):
             break
 
     time_elapsed = time.time() - since
-    logging.debug(f'Training complete in {time_elapsed // 60:.0f}m {time_elapsed % 60:.0f}s')
+    logging.info(f'Training complete in {time_elapsed // 60:.0f}m {time_elapsed % 60:.0f}s')
     for n, v in early_stopper.best_metrics.items():
-        logging.debug(f'Best val_{n}@{early_stopper.best_epoch+1} = {v}')
+        logging.info(f'Best val_{n}@{early_stopper.best_epoch+1} = {v}')
 
     # load best model weights
     model.load_state_dict(early_stopper.best_weights)
